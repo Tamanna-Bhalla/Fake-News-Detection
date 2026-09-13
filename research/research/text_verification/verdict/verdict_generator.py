@@ -3,13 +3,23 @@ import logging
 import os
 import re
 import socket
+import sys
 import time
+from pathlib import Path
 from urllib.parse import urlparse
 from typing import Dict, Any, List, Optional
 import requests
 from requests.exceptions import ReadTimeout
 
+# Enable standalone execution
+_research_dir = Path(__file__).resolve().parent.parent.parent
+if str(_research_dir) not in sys.path:
+    sys.path.insert(0, str(_research_dir))
+
 from text_verification.utils.source_credibility import get_source_credibility
+from text_verification.retrieval.source_ranker import SourceRanker
+from text_verification.verdict.evidence_extractor import EvidenceExtractor
+
 
 
 class VerdictGenerator:
@@ -111,18 +121,21 @@ class VerdictGenerator:
     def evaluate_claim_autonomously(
         self, claim: str, sources: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
-        """Autonomous fact-checking evaluation utilizing semantic similarity,
-        refutation detection, reporting consensus, and source credibility weighting.
+        """Evidence-based claim evaluation utilizing source quality tiers,
+        freshness decay, excerpt extraction, stance classification, and calibrated uncertainty.
         """
         claim_clean = (claim or "").strip()
         if not sources:
             return {
                 "claim": claim_clean,
+                "status": "unavailable",
                 "verdict": "Not Enough Information",
-                "confidence": 0.50,
+                "confidence": None,
                 "summary": "No credible news or reference sources were found discussing this claim.",
                 "explanation": "Searches across live news coverage and reference archives yielded no corroborating or refuting evidence.",
+                "limitations": ["No search results found across live news feeds or reference archives."],
                 "conflicting_sources": False,
+                "evidence": [],
                 "sources": [],
             }
 
@@ -149,107 +162,167 @@ class VerdictGenerator:
         else:
             similarities = None
 
-        evaluated_sources = []
-        refuting_sources = []
-        corroborating_sources = []
-
         claim_words = set(re.findall(r"\b\w{3,}\b", claim_clean.lower()))
+
+        evaluated_sources = []
+        evidence_items = []
+        refuting_evidence = []
+        corroborating_evidence = []
+        limitations = []
+
+        has_official_or_institutional = False
 
         for i, item in enumerate(sources):
             full_text = full_texts[i]
-            src_name = (item.get("source") or "News Source").strip()
+            src_name = (item.get("source") or item.get("publisher") or "News Source").strip()
 
             if similarities is not None:
-                similarity = similarities[i]
+                similarity = float(similarities[i])
             else:
                 doc_words = set(re.findall(r"\b\w{3,}\b", full_text.lower()))
-                similarity = len(claim_words & doc_words) / max(1, len(claim_words))
+                similarity = float(len(claim_words & doc_words) / max(1, len(claim_words)))
 
-            credibility = get_source_credibility(item.get("url") or src_name)
-            cred_weight = 1.3 if credibility == "High" else (1.0 if credibility == "Medium" else 0.7)
+            # Source quality and freshness ranking
+            quality_score, source_meta = SourceRanker.rank_source(item, relevance=similarity)
+            if source_meta["source_type"] in ("official", "institutional"):
+                has_official_or_institutional = True
+
+            # Extract structured citation with stance classification and SHA-256 fingerprint
+            evidence_item = EvidenceExtractor.create_evidence_item(
+                item,
+                claim_clean,
+                relevance=similarity,
+                source_type=source_meta["source_type"]
+            )
+            evidence_items.append(evidence_item)
 
             evaluated_item = dict(item)
             evaluated_item["similarity"] = round(similarity, 3)
-            evaluated_item["credibility"] = credibility
+            evaluated_item["credibility"] = source_meta["source_type"].capitalize()
+            evaluated_item["quality_score"] = quality_score
+            evaluated_item["stance"] = evidence_item["stance"]
             evaluated_sources.append(evaluated_item)
 
-            is_refuting = self._check_is_refuting(full_text, src_name) and similarity >= 0.22
-            is_affirming = any(p.search(full_text) for p in self.AFFIRM_PATTERNS) or similarity >= 0.48
+            if evidence_item["stance"] == "refutes" and similarity >= 0.22:
+                refuting_evidence.append(evidence_item)
+            elif evidence_item["stance"] == "supports" and similarity >= 0.30:
+                corroborating_evidence.append(evidence_item)
 
-            if is_refuting:
-                refuting_sources.append(evaluated_item)
-            elif similarity >= 0.32:
-                corroborating_sources.append(evaluated_item)
-
-        # Compute weighted evidence scores
-        refute_score = sum(s["similarity"] * 1.5 * (1.3 if s["credibility"] == "High" else 1.0) for s in refuting_sources)
-        support_score = sum(s["similarity"] * (1.3 if s["credibility"] == "High" else 1.0) for s in corroborating_sources)
-        top_sim = max((s["similarity"] for s in evaluated_sources), default=0.0)
-
-        # Sort sources by relevance
+        # Sort evidence by relevance
+        evidence_items.sort(key=lambda e: e["relevance"], reverse=True)
         evaluated_sources.sort(key=lambda s: s["similarity"], reverse=True)
 
+        if not has_official_or_institutional:
+            limitations.append("No primary government or peer-reviewed institutional source identified.")
+
+        SOURCE_TIER_WEIGHTS = {
+            "official": 1.00,
+            "institutional": 0.90,
+            "news": 0.75,
+            "encyclopedia": 0.65,
+            "other": 0.15,
+        }
+
+        # Compute weighted support and refute scores using source authority tiers
+        refute_score = sum(
+            e["relevance"] * (1.3 if e["source_type"] in ("official", "institutional", "news", "encyclopedia") else 0.8)
+            for e in refuting_evidence
+        )
+        support_score = sum(
+            e["relevance"] * SOURCE_TIER_WEIGHTS.get(e["source_type"], 0.15)
+            for e in corroborating_evidence
+        )
+
+        has_reputable_corroboration = any(
+            e["source_type"] in ("official", "institutional", "news", "encyclopedia")
+            for e in corroborating_evidence
+        )
+
+        # Check if the claim asserts formal attribution to an authoritative body
+        attribution_match = re.search(
+            r"\b(NASA|WHO|CDC|FDA|FBI|UN|Pentagon|White House|Supreme Court|Scientists|Researchers|Astronomers|Government)\b\s+(?:confirm(?:s|ed)?|announc(?:es|ed)?|prov(?:es|ed)?|claim(?:s|ed)?|declar(?:es|ed)?)",
+            claim_clean,
+            re.IGNORECASE
+        )
+        has_formal_attribution = bool(attribution_match)
+        attributed_entity = attribution_match.group(1) if attribution_match else ""
+
         # Decision Matrix
-        if refute_score >= 0.45 or (refuting_sources and any(s["similarity"] >= 0.38 for s in refuting_sources)):
+        has_conflict = len(refuting_evidence) > 0 and len(corroborating_evidence) > 0
+
+        # Case 1: Refuted / Debunked
+        if refute_score >= 0.28 or (refuting_evidence and any(e["relevance"] >= 0.30 for e in refuting_evidence)):
             verdict = "False"
+            status_val = "completed"
             confidence = round(min(0.96, 0.72 + (refute_score * 0.12)), 2)
-            top_refute = refuting_sources[0]
-            refuter_names = ", ".join(dict.fromkeys(s["source"] for s in refuting_sources[:3]))
-            summary = f"Refuted by fact-checking and news reporting from {refuter_names}."
+            top_refute = refuting_evidence[0]
+            refuter_names = ", ".join(dict.fromkeys(e["publisher"] for e in refuting_evidence[:3]))
+            summary = f"Refuted by fact-checking, reference, and independent reporting from {refuter_names}."
             explanation = (
-                f"Independent reporting and fact-checking records refute this claim. "
-                f"Key evidence from {top_refute['source']}: \"{top_refute['title']}\" "
-                f"({top_refute.get('content', '')[:160]}...)"
+                f"Credible reference and reporting sources directly refute or classify this claim as a myth/conspiracy theory. "
+                f"Key excerpt from {top_refute['publisher']}: \"{top_refute['excerpt']}\""
             )
-            has_conflict = len(corroborating_sources) > 0
 
-        elif support_score >= 0.50 and refute_score < 0.20:
-            verdict = "True"
-            confidence = round(min(0.96, 0.65 + (support_score * 0.12)), 2)
-            top_support = corroborating_sources[0]
-            supporter_names = ", ".join(dict.fromkeys(s["source"] for s in corroborating_sources[:3]))
-            summary = f"Corroborated by independent reporting from {supporter_names}."
+        # Case 2: Verified / Supported (Requires reputable institutional, news, or reference corroboration)
+        elif support_score >= 0.35 and refute_score < 0.18 and has_reputable_corroboration:
+            status_val = "completed"
+            top_support = corroborating_evidence[0]
+            supporter_names = ", ".join(dict.fromkeys(e["publisher"] for e in corroborating_evidence[:3]))
+
+            # Distinguish high-confidence Verified from Supported
+            if len(corroborating_evidence) >= 2 and any(e["relevance"] >= 0.45 and e["source_type"] in ("official", "institutional", "news", "encyclopedia") for e in corroborating_evidence):
+                verdict = "True"
+                confidence = round(min(0.98, 0.78 + (support_score * 0.10)), 2)
+                summary = f"Verified by consistent reporting across multiple independent sources ({supporter_names})."
+            else:
+                verdict = "True"
+                confidence = round(min(0.88, 0.65 + (support_score * 0.10)), 2)
+                summary = f"Supported by reporting from {supporter_names}."
+
             explanation = (
-                f"Multiple credible news and reference sources corroborate this claim. "
-                f"Primary report from {top_support['source']}: \"{top_support['title']}\" "
-                f"({top_support.get('content', '')[:160]}...)"
+                f"Available credible sources corroborate this claim. "
+                f"Primary excerpt from {top_support['publisher']}: \"{top_support['excerpt']}\""
             )
-            has_conflict = False
 
-        elif support_score >= 0.30 and refute_score >= 0.25:
+        # Case 3: Conflicting / Disputed context
+        elif has_conflict and support_score >= 0.25 and refute_score >= 0.20:
             verdict = "Misleading"
-            confidence = 0.75
-            summary = "Reporting presents conflicting accounts or indicates key contextual omissions in the claim."
+            status_val = "inconclusive"
+            confidence = 0.65
+            summary = "Reporting presents conflicting accounts or disputed context regarding this claim."
             explanation = (
-                f"Available news reports present conflicting or disputed accounts. "
-                f"Corroborating reports exist alongside refuting or cautionary statements."
+                "Available news and reference reports present conflicting accounts. "
+                "Corroborating statements exist alongside refuting or cautionary assessments."
             )
-            has_conflict = True
+            limitations.append("Conflicting claims or disputed accounts detected across independent publishers.")
 
-        elif support_score >= 0.32:
-            verdict = "True"
-            confidence = 0.70
-            top_support = corroborating_sources[0]
-            summary = f"Corroborated by news coverage from {top_support['source']}."
-            explanation = f"Reporting from {top_support['source']} supports the claim: \"{top_support['title']}\""
-            has_conflict = False
-
+        # Case 4: Insufficient Evidence / Uncorroborated Attribution
         else:
             verdict = "Not Enough Information"
-            confidence = 0.50
-            summary = "Available sources discuss related topics, but do not provide definitive confirmation or refutation."
-            explanation = "The claim could not be decisively verified as True or False based on currently available news and reference coverage."
-            has_conflict = False
+            status_val = "inconclusive"
+            confidence = None
+            if has_formal_attribution:
+                summary = f"Unverified attribution: No official confirmation from {attributed_entity} was found in authoritative sources."
+                explanation = f"The claim asserts that {attributed_entity} confirmed or announced this finding, but no direct records from official archives or major news agencies corroborate it."
+                limitations.append(f"No direct confirmation found from official {attributed_entity} records.")
+            else:
+                summary = "Available sources discuss related topics, but do not directly confirm or refute the claim."
+                explanation = "Evidence is insufficient to reach a conclusive verdict. Additional authoritative sources are required."
+                limitations.append("Retrieved coverage lacks direct confirmation or refutation of the core assertion.")
 
         return {
             "claim": claim_clean,
+            "status": status_val,
             "verdict": verdict,
             "confidence": confidence,
             "summary": summary,
             "explanation": explanation,
+            "limitations": limitations,
             "conflicting_sources": has_conflict,
+            "evidence": evidence_items[:6],
             "sources": evaluated_sources[:5],
         }
+
 
     def generate_direct_claim(self, claim: str) -> Dict[str, Any]:
         """Direct verification via local Ollama if online; raises RuntimeError if offline."""
@@ -300,3 +373,84 @@ class VerdictGenerator:
 
 
 __all__ = ["VerdictGenerator"]
+
+
+if __name__ == "__main__":
+    print("=" * 70)
+    print("DTI Text Verification Engine — Standalone Verdict Generator Demo")
+    print("=" * 70)
+
+    generator = VerdictGenerator()
+
+    # Demo 1: Corroborated / Verified Claim
+    sample_claim_1 = "NASA telescope observes water vapor on distant exoplanet"
+    sample_sources_1 = [
+        {
+            "title": "Webb Space Telescope Identifies Atmospheric Water on Exoplanet",
+            "url": "https://www.nasa.gov/missions/webb/atmospheric-water-exoplanet",
+            "publisher": "NASA",
+            "source": "NASA",
+            "snippet": "NASA scientists officially confirmed the detection of water vapor in the atmosphere of a giant gas exoplanet using the James Webb Space Telescope.",
+            "published_at": "2024-05-12T00:00:00Z"
+        },
+        {
+            "title": "Astronomers verify atmospheric water signatures",
+            "url": "https://nature.com/articles/exoplanet-atmosphere-water",
+            "publisher": "Nature",
+            "source": "Nature",
+            "snippet": "Independent peer-reviewed spectroscopic records verify the presence of atmospheric water vapor on the target planet.",
+            "published_at": "2024-05-15T00:00:00Z"
+        }
+    ]
+
+    print(f"\nEvaluating Claim 1: \"{sample_claim_1}\"")
+    result_1 = generator.generate(sample_claim_1, sample_sources_1)
+    print(f"  Verdict:    {result_1['verdict']} (Confidence: {result_1['confidence']})")
+    print(f"  Summary:    {result_1['summary']}")
+    print(f"  Evidence:   {len(result_1['evidence'])} citations extracted")
+    for ev in result_1['evidence']:
+        print(f"    - [{ev['stance'].upper()}] {ev['publisher']}: \"{ev['excerpt'][:70]}...\"")
+
+    # Demo 2: Refuted Claim
+    sample_claim_2 = "Scientists announce Moon was completely hollowed out by ancient aliens"
+    sample_sources_2 = [
+        {
+            "title": "Fact Check: Debunking viral hollow moon alien base conspiracy theory",
+            "url": "https://reuters.com/fact-check/hollow-moon-aliens-debunked",
+            "publisher": "Reuters",
+            "source": "Reuters",
+            "snippet": "Fact-checking organizations have thoroughly debunked viral social media claims alleging the Moon is hollow. NASA planetary records confirm seismic data showing a solid iron core.",
+            "published_at": "2024-06-01T00:00:00Z"
+        }
+    ]
+
+    print(f"\nEvaluating Claim 2: \"{sample_claim_2}\"")
+    result_2 = generator.generate(sample_claim_2, sample_sources_2)
+    print(f"  Verdict:    {result_2['verdict']} (Confidence: {result_2['confidence']})")
+    print(f"  Summary:    {result_2['summary']}")
+    for ev in result_2['evidence']:
+        print(f"    - [{ev['stance'].upper()}] {ev['publisher']}: \"{ev['excerpt'][:70]}...\"")
+
+    # Demo 3: Inconclusive Claim (Not Enough Information)
+    sample_claim_3 = "New transit line proposed between two neighboring towns"
+    sample_sources_3 = [
+        {
+            "title": "General regional transportation overview and highway report",
+            "url": "https://example.com/transit",
+            "publisher": "Local Forum",
+            "source": "Local Forum",
+            "snippet": "Discussion of regional road networks and traffic signals across county routes.",
+            "published_at": "2023-01-01T00:00:00Z"
+        }
+    ]
+
+    print(f"\nEvaluating Claim 3: \"{sample_claim_3}\"")
+    result_3 = generator.generate(sample_claim_3, sample_sources_3)
+    print(f"  Verdict:    {result_3['verdict']} (Confidence: {result_3['confidence']})")
+    print(f"  Summary:    {result_3['summary']}")
+    print(f"  Limitations: {result_3['limitations']}")
+
+    print("\n" + "=" * 70)
+    print("Standalone execution completed successfully.")
+    print("=" * 70)
+

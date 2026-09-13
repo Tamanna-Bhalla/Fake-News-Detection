@@ -1,0 +1,39 @@
+# Git & IDE
+.git
+.gitignore
+.idea
+.vscode
+*.swp
+*.swo
+
+# Python Caches & Build Artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Node & Frontend Build Artifacts
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+DTI-frontend/headline-verifier/dist/
+DTI-frontend/headline-verifier/node_modules/
+*.log
+
+# Environment & Secret Files
+.env
+.env.local
+.env.*.local
+
+# Training datasets and heavy evaluation manifests
+Image Detection/data/
+Image Detection/raw/
+research/data/
+*.h5.bak

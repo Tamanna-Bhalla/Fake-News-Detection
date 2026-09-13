@@ -1,0 +1,23 @@
+# Core Web Framework
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+slowapi
+structlog
+python-dotenv
+
+# Text Verification & NLP
+sentence-transformers
+transformers
+torch
+beautifulsoup4
+scikit-learn
+requests
+
+# Image Manipulation & Forensics
+numpy
+opencv-python-headless
+pillow
+scipy
+tensorflow

@@ -50,11 +50,19 @@ async def run_verification(claim: str, pipeline=None) -> dict:
         # with fields: claim, normalized_claim, verdict, confidence, summary, reason, explanation
         return {
             "claim": result.get("claim"),
+            "normalized_claim": result.get("normalized_claim"),
+            "claim_type": result.get("claim_type", "current_event"),
+            "status": result.get("status", "completed"),
             "verdict": _normalize_verdict(result.get("verdict")),
             "confidence": float(result.get("confidence")) if result.get("confidence") is not None else None,
             "summary": result.get("summary"),
             "explanation": result.get("explanation"),
+            "limitations": result.get("limitations", []),
+            "evidence": result.get("evidence", []),
+            "sources": result.get("sources", []),
+            "conflicting_sources": result.get("conflicting_sources", False),
         }
+
     except asyncio.TimeoutError:
         raise
     except Exception as e:

@@ -1,0 +1,41 @@
+{
+  "model_version": "image-detector-2026.01",
+  "architecture": "EfficientNetB0-Forensic-Hybrid",
+  "input_size": 224,
+  "weights_file": "efficientnetb0_fake_detector.keras",
+  "fusion_version": "v3-calibrated",
+  "weights": {
+    "cnn_features": 0.40,
+    "ela_compression": 0.35,
+    "noise_residual": 0.25
+  },
+  "thresholds": {
+    "authentic": 0.35,
+    "suspicious": 0.50,
+    "manipulated": 0.65
+  },
+  "calibration": {
+    "method": "platt_scaling",
+    "sigmoid_midpoint": 0.265,
+    "sigmoid_scale": 10.0,
+    "expected_calibration_error": 0.042,
+    "brier_score": 0.088
+  },
+  "benchmark_metrics": {
+    "accuracy": 0.864,
+    "balanced_accuracy": 0.862,
+    "precision": 0.875,
+    "recall": 0.848,
+    "f1_score": 0.861,
+    "specificity": 0.876,
+    "false_positive_rate": 0.124,
+    "false_negative_rate": 0.152,
+    "auroc": 0.932,
+    "auprc": 0.924
+  },
+  "training_metadata": {
+    "random_seed": 42,
+    "leakage_prevention": "source_grouped_splits",
+    "supported_formats": ["JPEG", "PNG", "WEBP", "BMP", "TIFF", "GIF"]
+  }
+}

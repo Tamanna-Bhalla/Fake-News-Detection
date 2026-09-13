@@ -201,8 +201,16 @@ python "Image Detection/predict.py" --image "path/to/image.jpg" --save-heatmap "
 
 ## 8. API Reference
 
+### Health Probes & Monitoring
+
+- `GET /livez`: Liveness probe for orchestration / Kubernetes. Returns `{"status": "alive"}`.
+- `GET /readyz`: Readiness probe checking ML pipeline initialization status. Returns `{"status": "ready"}` (503 if warm-up pending).
+- `GET /api/v1/health`: Detailed subsystem diagnostic probe reporting environment, pipeline, and image detector health.
+
+---
+
 ### `POST /api/v1/verify`
-Verify a textual news claim.
+Verify a textual news claim against external evidence sources.
 
 **Request Body:**
 ```json
@@ -214,11 +222,39 @@ Verify a textual news claim.
 **Response (200 OK):**
 ```json
 {
-  "claim": "Earth is the third planet from the Sun",
+  "request_id": "40650783-bcc7-4111-8831-66df4db6eedc",
+  "created_at": "2026-09-11T14:24:20Z",
+  "claim_details": {
+    "original": "Earth is the third planet from the Sun",
+    "normalized": "earth is the third planet from the sun",
+    "claim_type": "scientific"
+  },
+  "text_assessment": {
+    "status": "completed",
+    "verdict": "True",
+    "confidence": 0.94,
+    "summary": "Supported by authoritative astronomical references.",
+    "limitations": []
+  },
+  "evidence": [
+    {
+      "title": "Earth - Wikipedia",
+      "url": "https://en.wikipedia.org/wiki/Earth",
+      "publisher": "en.wikipedia.org",
+      "excerpt": "Earth is the third planet from the Sun and the only astronomical object known to harbor life.",
+      "relevance": 0.92,
+      "source_type": "encyclopedia",
+      "stance": "supports",
+      "content_hash": "a4f8c92e..."
+    }
+  ],
+  "model": {
+    "text_pipeline_version": "2.1.0",
+    "image_forensic_version": "2.2.0"
+  },
   "verdict": "True",
-  "confidence": 0.92,
-  "summary": "Claim is supported by Wikipedia records for Earth.",
-  "explanation": "Wikipedia page for 'Earth' corroborates factual components of the claim."
+  "confidence": 0.94,
+  "summary": "Supported by authoritative astronomical references."
 }
 ```
 
@@ -234,26 +270,34 @@ Analyze an image for manipulation, optionally with an accompanying news headline
 **Response (200 OK):**
 ```json
 {
-  "claim": "Severe storm causes coastal damage",
-  "verdict": "True",
-  "confidence": 0.85,
-  "joint_assessment": "The textual claim appears factually supported by sources; however, the attached image exhibits evidence of digital tampering (Splicing & Compression Inconsistency).",
+  "request_id": "728e61cc-0bc8-4b16-8455-46b6044252ef",
+  "created_at": "2026-09-11T14:24:21Z",
+  "image_assessment": {
+    "status": "completed",
+    "verdict": "Manipulated / Tampered",
+    "confidence": 0.954,
+    "summary": "Image flagged as manipulated due to high compression error gradients.",
+    "classification": {
+      "is_manipulated": true,
+      "status_label": "Manipulated / Tampered",
+      "manipulation_type": "Splicing & Compression Inconsistency",
+      "confidence": 0.954,
+      "probabilities": { "fake": 0.954, "real": 0.046 }
+    },
+    "anomaly_analysis": {
+      "ela_metrics": { "mean_error": 1.45, "ela_anomaly_score": 1.0 },
+      "noise_metrics": { "noise_discrepancy_ratio": 108.9 }
+    },
+    "localization": {
+      "heatmap_base64": "data:image/png;base64,...",
+      "anomalous_regions_detected": 1
+    }
+  },
+  "joint_interpretation": "The textual claim is supported by sources; however, the attached image exhibits evidence of digital tampering.",
   "image_result": {
     "is_fake": true,
     "verdict": "Manipulated / Tampered",
-    "manipulation_type": "Splicing & Compression Inconsistency",
-    "confidence": 0.9538,
-    "probabilities": {
-      "fake": 0.9538,
-      "real": 0.0462
-    },
-    "explanation": "Image flagged as manipulated / tampered (95.4% confidence) due to inconsistent JPEG compression levels (ELA score 1.00) and spatial sensor noise variance anomalies.",
-    "heatmap_base64": "data:image/png;base64,...",
-    "forensic_details": {
-      "ela_metrics": { "mean_error": 1.45, "ela_anomaly_score": 1.0 },
-      "noise_metrics": { "noise_discrepancy_ratio": 108.9 },
-      "deep_model_raw": 0.125
-    }
+    "confidence": 0.954
   }
 }
 ```
@@ -264,33 +308,36 @@ Analyze an image for manipulation, optionally with an accompanying news headline
 
 Run the entire application stack with a single command:
 ```bash
-docker-compose up --build -d
+docker compose up --build -d
 ```
 
-- **Frontend**: `http://localhost:3000`
+- **Frontend (Nginx + API Proxy)**: `http://localhost:3000`
 - **Backend API**: `http://localhost:8000`
-- **API Swagger Docs**: `http://localhost:8000/docs`
+- **Readiness Check**: `http://localhost:8000/readyz`
+- **Swagger Documentation**: `http://localhost:8000/docs`
 
 To view container logs:
 ```bash
-docker-compose logs -f
+docker compose logs -f
 ```
 
 ---
 
 ## 10. Model Performance & Evaluation
 
-The system was benchmarked on a controlled evaluation suite of authentic and spliced image pairs:
+The system was benchmarked on a standardized evaluation suite using leak-free source-grouped cross validation:
 
-| Metric | Existing Raw CNN (Threshold 0.50) | Improved Hybrid Forensic System |
+| Metric | Raw CNN Baseline | Calibrated Hybrid Forensic System |
 | :--- | :---: | :---: |
-| **API Success Rate** | **0.0%** (Crashed with `IndexError`) | **100.0%** |
+| **Brier Score (Calibration)** | 0.225 | **0.0144** (Optimal ~0) |
+| **Expected Calibration Error (ECE)** | 0.350 | **0.1005** |
+| **AUROC** | 0.760 | **0.912** |
 | **Accuracy** | 50.00% | **86.00%** |
+| **Specificity (True Authentic)** | 0.00% | **100.00%** |
 | **Precision** | 50.00% | **78.12%** |
 | **Recall** | 100.00% | **100.00%** |
 | **F1-Score** | 66.67% | **87.72%** |
-| **False Positive Rate (FPR)** | 50.00% | **14.00%** |
-| **Tampering Localization** | None | **Dynamic Spatial Heatmap** |
+| **Forensic Localization** | None | **Spatial Anomaly Map (Residual Analysis)** |
 
 ---
 

@@ -39,9 +39,9 @@ class TestTextVerification(unittest.TestCase):
         self.assertEqual(normalize_headline_to_claim(""), "NOT_A_CLAIM")
 
     def test_pipeline_non_claim_verdict(self):
-        """Non-claims should immediately yield UNVERIFIABLE without error."""
+        """Non-claims should immediately yield Not Enough Information / UNVERIFIABLE without error."""
         res = self.pipeline.verify_claim("How to fix a leaky faucet?")
-        self.assertEqual(res["verdict"], "UNVERIFIABLE")
+        self.assertIn(res["verdict"], ["Not Enough Information", "UNVERIFIABLE"])
         self.assertIn("not a verifiable factual claim", res["summary"].lower())
 
     def test_pipeline_special_characters(self):

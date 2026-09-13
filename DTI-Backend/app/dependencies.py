@@ -22,9 +22,17 @@ except ImportError:
     MODEL_AVAILABLE = False
     logger.warning("text_verification_module_not_found", detail="Running without AI model.")
 
-# Module-level singletons
+import asyncio
+from app.services.image_service import get_image_detector, ImageManipulationDetector
+
+# Module-level singletons and thread-safe lock
 _pipeline: Optional[Any] = None
 pipeline_ready: bool = False
+_image_detector: Optional[Any] = None
+image_detector_ready: bool = False
+_init_lock = asyncio.Lock()
+# Bounded semaphore to prevent concurrent TensorFlow inference memory and CPU exhaustion
+image_inference_semaphore = asyncio.Semaphore(2)
 
 async def init_pipeline() -> None:
     """
@@ -41,7 +49,6 @@ async def init_pipeline() -> None:
         return
 
     try:
-        import asyncio
         loop = asyncio.get_event_loop()
         logger.info("initializing_pipeline")
         _pipeline = await loop.run_in_executor(
@@ -60,20 +67,45 @@ async def init_pipeline() -> None:
         pipeline_ready = False
         logger.error("pipeline_initialization_failed", error=str(e))
 
+async def init_image_detector_service() -> None:
+    """Initializes the image manipulation detector and pre-loads Keras model once at startup."""
+    global _image_detector, image_detector_ready
+    try:
+        loop = asyncio.get_event_loop()
+        logger.info("initializing_image_detector")
+        _image_detector = await loop.run_in_executor(
+            None,
+            get_image_detector
+        )
+        image_detector_ready = _image_detector is not None and getattr(_image_detector, "model", None) is not None
+        logger.info("image_detector_initialized", model_ready=image_detector_ready)
+    except Exception as e:
+        _image_detector = None
+        image_detector_ready = False
+        logger.error("image_detector_initialization_failed", error=str(e))
+
+async def init_dependencies() -> None:
+    """Run all dependency initializations in startup lifespan."""
+    await asyncio.gather(
+        init_pipeline(),
+        init_image_detector_service(),
+        return_exceptions=True
+    )
+
 def get_pipeline() -> Optional[Any]:
-    """
-    FastAPI dependency to inject the pipeline into our routes.
-    Includes on-demand fallback initialization.
-    """
+    """FastAPI dependency to inject the pipeline into our routes."""
     global _pipeline, pipeline_ready
-    if _pipeline is None and MODEL_AVAILABLE:
-        try:
-            _pipeline = VerificationPipeline()
-            pipeline_ready = True
-        except Exception as e:
-            logger.warning("lazy_pipeline_init_failed", error=str(e))
     return _pipeline
 
-
 def get_pipeline_status() -> bool:
-    return _pipeline is not None
+    return _pipeline is not None and pipeline_ready
+
+def get_image_service():
+    """FastAPI dependency to get the image manipulation detector."""
+    global _image_detector
+    if _image_detector is None:
+        _image_detector = get_image_detector()
+    return _image_detector
+
+def get_image_detector_status() -> bool:
+    return _image_detector is not None and getattr(_image_detector, "model", None) is not None

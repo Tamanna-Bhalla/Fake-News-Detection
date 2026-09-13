@@ -1,67 +1,138 @@
 import asyncio
-import logging
-from fastapi import APIRouter, Depends, Request, File, UploadFile, Form
+from datetime import datetime, timezone
+from typing import Optional, List
+from fastapi import APIRouter, Depends, Request, File, UploadFile, Form, HTTPException
 from fastapi.responses import JSONResponse
 from slowapi import Limiter
 from slowapi.util import get_remote_address
-from typing import Optional
+import structlog
 
 from app.config import settings
 from app.models.requests import VerifyRequest
-from app.models.responses import VerifyResponse, ImageVerificationResult
-from app.dependencies import get_pipeline
+from app.models.responses import (
+    VerifyResponse,
+    TextAssessment,
+    ImageAssessment,
+    ClassificationDetails,
+    AnomalyAnalysis,
+    LocalizationDetails,
+    ClaimMetadata,
+    EvidenceCitation,
+    ImageVerificationResult,
+    ModelVersionInfo,
+)
+from app.dependencies import get_pipeline, get_image_service, image_inference_semaphore
 from app.services.verification_service import run_verification
-from app.services.image_service import get_image_detector
+from app.utils.validators import validate_claim_text, stream_and_validate_image_upload
+from app.utils.error_handlers import make_error_response
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 router = APIRouter()
 
-# Setup rate limiter using the user's IP address
+# Setup rate limiter using user remote IP
 limiter = Limiter(key_func=get_remote_address)
+
 
 @router.post("/verify", response_model=VerifyResponse)
 @limiter.limit(settings.RATE_LIMIT)
 async def verify_claim(
     request: Request,
     body: VerifyRequest,
-    pipeline = Depends(get_pipeline)
+    pipeline=Depends(get_pipeline)
 ):
     """
     Takes a news headline claim and passes it to the AI verification pipeline.
+    Produces evidence-grounded assessment, source citations, and epistemic classification.
     """
-    if not body.claim:
-        return JSONResponse(
-            status_code=400,
-            content={"error": "missing_claim", "detail": "Either 'claim' must be provided."}
-        )
-    
-    if pipeline is None:
-        return JSONResponse(
-            status_code=503,
-            content={"error": "service_unavailable", "detail": "Verification service is not ready yet."}
-        )
-        
+    request_id = getattr(request.state, "request_id", None)
+
+    # 1. Strict claim input sanitization & validation
     try:
-        raw_result = await run_verification(body.claim, pipeline=pipeline)
-        return VerifyResponse(**raw_result)
-        
-    except asyncio.TimeoutError:
-        return JSONResponse(
-            status_code=504,
-            content={"error": "verification_timeout", "detail": "Verification timed out. Try a shorter claim."}
+        clean_claim = validate_claim_text(body.claim)
+    except HTTPException as exc:
+        return make_error_response(
+            status_code=exc.status_code,
+            code="VALIDATION_ERROR",
+            message=str(exc.detail),
+            request=request
         )
-        
-    except RuntimeError:
-        return JSONResponse(
+
+    if pipeline is None:
+        return make_error_response(
+            status_code=503,
+            code="SERVICE_UNAVAILABLE",
+            message="Verification service is initializing. Please retry shortly.",
+            request=request
+        )
+
+    try:
+        raw_result = await run_verification(clean_claim, pipeline=pipeline)
+
+        # Build evidence items
+        evidence_list: List[EvidenceCitation] = []
+        for ev in raw_result.get("evidence", []):
+            try:
+                evidence_list.append(EvidenceCitation(**ev))
+            except Exception:
+                continue
+
+        text_assessment = TextAssessment(
+            status=raw_result.get("status", "completed"),
+            verdict=raw_result.get("verdict", "Not Enough Information"),
+            confidence=raw_result.get("confidence"),
+            summary=raw_result.get("summary", ""),
+            limitations=raw_result.get("limitations", []),
+            error_code=None
+        )
+
+        claim_metadata = ClaimMetadata(
+            original=clean_claim,
+            normalized=raw_result.get("normalized_claim"),
+            claim_type=raw_result.get("claim_type", "current_event")
+        )
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        return VerifyResponse(
+            request_id=request_id,
+            created_at=now_iso,
+            claim_details=claim_metadata,
+            text_assessment=text_assessment,
+            evidence=evidence_list,
+            model=ModelVersionInfo(),
+            # Backward-compatible fields
+            claim=clean_claim,
+            verdict=text_assessment.verdict,
+            confidence=text_assessment.confidence,
+            summary=text_assessment.summary,
+            explanation=raw_result.get("explanation"),
+            sources=raw_result.get("sources", [])
+        )
+
+    except asyncio.TimeoutError:
+        return make_error_response(
+            status_code=504,
+            code="GATEWAY_TIMEOUT",
+            message="Verification timed out while querying external knowledge sources. Try a shorter claim.",
+            request=request
+        )
+
+    except RuntimeError as exc:
+        logger.error("verification_pipeline_runtime_error", error=str(exc), request_id=request_id)
+        return make_error_response(
             status_code=500,
-            content={"error": "pipeline_error", "detail": "Verification failed due to an internal error."}
+            code="INTERNAL_ERROR",
+            message="Verification failed due to an internal pipeline error.",
+            request=request
         )
 
     except Exception as exc:
-        logger.exception("verify_claim failed")
-        return JSONResponse(
+        logger.exception("verify_claim failed", exc_info=exc)
+        return make_error_response(
             status_code=500,
-            content={"error": "response_mapping_error", "detail": "Result could not be processed."}
+            code="INTERNAL_ERROR",
+            message="Result could not be processed.",
+            request=request
         )
 
 
@@ -111,101 +182,170 @@ def _synthesize_joint_assessment(claim_verdict: Optional[str], image_result: Ima
 async def verify_image(
     request: Request,
     file: UploadFile = File(...),
-    claim: Optional[str] = Form(None)
+    claim: Optional[str] = Form(None),
+    detector=Depends(get_image_service)
 ):
     """
-    Verify an image for manipulation/fakeness. Optionally include a text claim to verify alongside.
-    
-    Args:
-        file: Image file (jpg, png, webp, etc.)
-        claim: Optional text claim to verify alongside the image
+    Verify an image for digital manipulation and forensic anomalies.
+    Optionally evaluates an accompanying text claim to provide a joint multimodal assessment.
     """
-    if not file.filename:
-        return JSONResponse(
-            status_code=400,
-            content={"error": "missing_file", "detail": "Image file is required."}
-        )
-    
-    # Validate file extension
-    valid_extensions = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
-    file_ext = "." + file.filename.split(".")[-1].lower() if "." in file.filename else ""
-    if file_ext not in valid_extensions:
-        return JSONResponse(
-            status_code=400,
-            content={"error": "invalid_file_type", "detail": f"Unsupported image format. Use one of: {', '.join(sorted(valid_extensions))}"}
-        )
-    
-    try:
-        # Read image bytes with size limit (max 10MB)
-        MAX_FILE_SIZE = 10 * 1024 * 1024
-        image_bytes = await file.read()
-        if not image_bytes:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "empty_file", "detail": "Image file is empty."}
-            )
+    request_id = getattr(request.state, "request_id", None)
 
-        if len(image_bytes) > MAX_FILE_SIZE:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "file_too_large", "detail": "Image file exceeds the 10MB size limit."}
-            )
-        
-        # Run image detection
-        detector = get_image_detector()
-        image_result = detector.predict(image_bytes)
-        
-        # Convert to response model
-        image_verification = ImageVerificationResult(**image_result)
-        
-        # If a text claim was also provided, verify it as well
+    # 1. Stream image bytes in chunks and perform security checks with Pillow
+    try:
+        image_bytes, img_meta = await stream_and_validate_image_upload(file)
+    except HTTPException as exc:
+        code = "FILE_TOO_LARGE" if exc.status_code == 413 else (
+            "UNSUPPORTED_MEDIA_TYPE" if exc.status_code == 415 else "VALIDATION_ERROR"
+        )
+        return make_error_response(
+            status_code=exc.status_code,
+            code=code,
+            message=str(exc.detail),
+            request=request
+        )
+
+    # 2. Run image forensic detection with bounded concurrency semaphore
+    try:
+        async with image_inference_semaphore:
+            loop = asyncio.get_event_loop()
+            image_result_dict = await loop.run_in_executor(None, detector.predict, image_bytes)
+
+        image_verification = ImageVerificationResult(**image_result_dict)
+
+        # Build modern ImageAssessment
+        classification_data = image_result_dict.get("classification") or {
+            "label": "manipulated" if image_verification.is_fake else "authentic",
+            "probability": float(image_verification.confidence)
+        }
+        anomaly_data = image_result_dict.get("anomaly_analysis") or {
+            "ela_score": 0.0,
+            "noise_score": 0.0,
+            "forensic_details": image_result_dict.get("forensic_details")
+        }
+        localization_data = image_result_dict.get("localization") or {
+            "available": image_verification.heatmap_base64 is not None,
+            "heatmap_type": "forensic_anomaly",
+            "heatmap_base64": image_verification.heatmap_base64
+        }
+
+        image_assessment = ImageAssessment(
+            status="completed" if image_verification.error is None else "unsupported",
+            verdict=image_verification.verdict or "Unknown",
+            confidence=image_verification.confidence if image_verification.is_fake is not None else None,
+            classification=ClassificationDetails(**classification_data),
+            anomaly_analysis=AnomalyAnalysis(**anomaly_data),
+            localization=LocalizationDetails(**localization_data),
+            disclaimer=image_result_dict.get(
+                "disclaimer",
+                "Automated forensic assessment: anomalies indicate statistical compression/noise discrepancies, not definitive proof of manipulation."
+            ),
+            error_code=None if image_verification.error is None else "FORENSIC_ERROR"
+        )
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        # 3. Multimodal: If text claim is provided, verify it concurrently
         if claim and claim.strip():
-            clean_claim = claim.strip()
-            if len(clean_claim) > 500:
-                return JSONResponse(
-                    status_code=422,
-                    content={"error": "validation_error", "detail": "Claim text exceeds maximum allowed length (500 characters)."}
-                )
+            clean_claim = validate_claim_text(claim.strip())
+            evidence_list: List[EvidenceCitation] = []
 
             try:
                 text_result = await run_verification(clean_claim)
+                for ev in text_result.get("evidence", []):
+                    try:
+                        evidence_list.append(EvidenceCitation(**ev))
+                    except Exception:
+                        continue
+
+                text_assessment = TextAssessment(
+                    status=text_result.get("status", "completed"),
+                    verdict=text_result.get("verdict", "Not Enough Information"),
+                    confidence=text_result.get("confidence"),
+                    summary=text_result.get("summary", ""),
+                    limitations=text_result.get("limitations", []),
+                    error_code=None
+                )
             except asyncio.TimeoutError:
-                logger.warning("Text verification timed out during multimodal call.")
+                logger.warning("text_verification_timeout_multimodal", request_id=request_id)
+                # Honest failure: confidence is null, status is unavailable
                 text_result = {
                     "verdict": "Not Enough Information",
-                    "confidence": 0.5,
+                    "confidence": None,
                     "summary": "Text verification timed out while querying external knowledge sources.",
                     "explanation": "Image manipulation analysis completed successfully, but claim verification timed out.",
+                    "limitations": ["Retrieval timeout: external sources did not respond within time limit."],
                 }
+                text_assessment = TextAssessment(
+                    status="unavailable",
+                    verdict="Not Enough Information",
+                    confidence=None,
+                    summary=text_result["summary"],
+                    limitations=text_result["limitations"],
+                    error_code="RETRIEVAL_TIMEOUT"
+                )
             except Exception as exc:
-                logger.warning("Text verification failed during multimodal call: %s", exc)
+                logger.warning("text_verification_failed_multimodal", error=str(exc), request_id=request_id)
                 text_result = {
                     "verdict": "Not Enough Information",
-                    "confidence": 0.5,
+                    "confidence": None,
                     "summary": f"Text verification was temporarily unavailable ({type(exc).__name__}).",
                     "explanation": "Image manipulation analysis completed successfully, but text verification encountered a transient error.",
+                    "limitations": [f"Pipeline error: {type(exc).__name__}"],
                 }
+                text_assessment = TextAssessment(
+                    status="unavailable",
+                    verdict="Not Enough Information",
+                    confidence=None,
+                    summary=text_result["summary"],
+                    limitations=text_result["limitations"],
+                    error_code="PIPELINE_ERROR"
+                )
 
             joint_eval = _synthesize_joint_assessment(text_result.get("verdict"), image_verification)
 
+            claim_meta = ClaimMetadata(
+                original=clean_claim,
+                normalized=text_result.get("normalized_claim"),
+                claim_type=text_result.get("claim_type", "current_event")
+            )
+
             return VerifyResponse(
+                request_id=request_id,
+                created_at=now_iso,
+                claim_details=claim_meta,
+                text_assessment=text_assessment,
+                image_assessment=image_assessment,
+                evidence=evidence_list,
+                joint_interpretation=joint_eval,
+                model=ModelVersionInfo(),
+                # Backward-compatible fields
                 claim=clean_claim,
-                verdict=text_result.get("verdict"),
-                confidence=text_result.get("confidence"),
-                summary=text_result.get("summary"),
+                verdict=text_assessment.verdict,
+                confidence=text_assessment.confidence,
+                summary=text_assessment.summary,
                 explanation=text_result.get("explanation"),
                 image_result=image_verification,
                 joint_assessment=joint_eval
             )
         else:
-            # Return image verification result
+            # Standalone image verification response
             return VerifyResponse(
+                request_id=request_id,
+                created_at=now_iso,
+                image_assessment=image_assessment,
+                model=ModelVersionInfo(),
+                # Backward-compatible fields
                 image_result=image_verification
             )
-    
+
+    except HTTPException:
+        raise
     except Exception as exc:
-        logger.exception("verify_image failed")
-        return JSONResponse(
+        logger.exception("verify_image failed", exc_info=exc)
+        return make_error_response(
             status_code=500,
-            content={"error": "image_verification_failed", "detail": f"Image analysis failed: {type(exc).__name__}"}
+            code="INTERNAL_ERROR",
+            message=f"Image analysis failed: {type(exc).__name__}",
+            request=request
         )

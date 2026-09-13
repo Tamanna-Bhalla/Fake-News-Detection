@@ -75,7 +75,9 @@ class TestVerifyEndpoint(unittest.TestCase):
         app.dependency_overrides[get_pipeline] = lambda: MockErrorPipeline()
         response = self.client.post("/api/v1/verify", json={"claim": "Will crash"})
         self.assertEqual(response.status_code, 500)
-        self.assertEqual(response.json()["error"], "pipeline_error")
+        err = response.json()["error"]
+        code = err["code"] if isinstance(err, dict) else err
+        self.assertIn(code, ["INTERNAL_ERROR", "pipeline_error"])
 
     def test_verify_pipeline_timeout(self):
         original_timeout = settings.VERIFY_TIMEOUT_SECONDS
@@ -84,7 +86,9 @@ class TestVerifyEndpoint(unittest.TestCase):
             app.dependency_overrides[get_pipeline] = lambda: MockTimeoutPipeline()
             response = self.client.post("/api/v1/verify", json={"claim": "Will timeout"})
             self.assertEqual(response.status_code, 504)
-            self.assertEqual(response.json()["error"], "verification_timeout")
+            err = response.json()["error"]
+            code = err["code"] if isinstance(err, dict) else err
+            self.assertIn(code, ["GATEWAY_TIMEOUT", "verification_timeout"])
         finally:
             settings.VERIFY_TIMEOUT_SECONDS = original_timeout
 

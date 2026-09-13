@@ -298,14 +298,54 @@ class ImageManipulationDetector:
             logger.warning("invalid_image_file error=%s", exc)
             return {
                 "is_fake": None,
-                "verdict": None,
+                "verdict": "Unknown",
                 "manipulation_type": None,
                 "confidence": 0.0,
+                "classification": {"label": "unknown", "probability": 0.5},
+                "anomaly_analysis": {"ela_score": 0.0, "noise_score": 0.0, "forensic_details": None},
+                "localization": {"available": False, "heatmap_type": "forensic_anomaly", "heatmap_base64": None},
                 "probabilities": {"fake": 0.0, "real": 0.0},
                 "explanation": f"Failed to load image: {type(exc).__name__}",
                 "forensic_details": None,
                 "heatmap_base64": None,
+                "disclaimer": "Failed to decode image stream.",
                 "error": f"Invalid image file: {str(exc)}",
+            }
+
+        # Out-of-Distribution & Unsupported Quality Guardrails
+        if image.width < 32 or image.height < 32:
+            return {
+                "is_fake": None,
+                "verdict": "Unsupported / Low quality",
+                "manipulation_type": "Low Resolution",
+                "confidence": 0.0,
+                "classification": {"label": "unknown", "probability": 0.5},
+                "anomaly_analysis": {"ela_score": 0.0, "noise_score": 0.0, "forensic_details": None},
+                "localization": {"available": False, "heatmap_type": "forensic_anomaly", "heatmap_base64": None},
+                "probabilities": {"fake": 0.0, "real": 0.0},
+                "explanation": f"Image resolution ({image.width}x{image.height}px) is too low for reliable forensic analysis.",
+                "forensic_details": {"dimensions": {"width": image.width, "height": image.height}},
+                "heatmap_base64": None,
+                "disclaimer": "Input resolution is insufficient to extract compression grids or sensor noise residuals.",
+                "error": None,
+            }
+
+        gray_arr = np.array(image.convert("L"), dtype=np.float32)
+        if float(np.std(gray_arr)) < 1.5:
+            return {
+                "is_fake": None,
+                "verdict": "Unsupported / Low quality",
+                "manipulation_type": "Uniform Content",
+                "confidence": 0.0,
+                "classification": {"label": "unknown", "probability": 0.5},
+                "anomaly_analysis": {"ela_score": 0.0, "noise_score": 0.0, "forensic_details": None},
+                "localization": {"available": False, "heatmap_type": "forensic_anomaly", "heatmap_base64": None},
+                "probabilities": {"fake": 0.0, "real": 0.0},
+                "explanation": "Image content is uniform or lacks spatial variance necessary for forensic analysis.",
+                "forensic_details": {"dimensions": {"width": image.width, "height": image.height}},
+                "heatmap_base64": None,
+                "disclaimer": "Uniform images lack textural signal for noise or compression analysis.",
+                "error": None,
             }
 
         # 1. Forensic Stream: ELA
@@ -324,7 +364,7 @@ class ImageManipulationDetector:
             noise_map = np.zeros((image.height, image.width), dtype=np.float32)
             noise_metrics = {"noise_anomaly_score": 0.0, "noise_discrepancy_ratio": 1.0}
 
-        # 3. Spatial Tampering Heatmap
+        # 3. Spatial Forensic Anomaly Map (formerly "tampering heatmap")
         try:
             heatmap_b64 = self.forensics.generate_heatmap(ela_map, noise_map)
         except Exception as exc:
@@ -340,8 +380,6 @@ class ImageManipulationDetector:
             try:
                 prepared = self._prepare_cnn_input(image)
                 preds = self.model.predict(prepared, verbose=0)
-                
-                # FIXED: Unpack single sigmoid scalar correctly (shape (1, 1))
                 raw_val = float(preds[0][0])
                 raw_model_output = round(raw_val, 4)
                 model_real_score, model_fake_score = self._calibrate_model_score(raw_val)
@@ -360,7 +398,7 @@ class ImageManipulationDetector:
         )
 
         # Forensic anomaly booster: if either ELA or Noise shows strong physical inconsistency (>= 0.70),
-        # ensure combined probability properly flags physical tampering evidence.
+        # flag physical anomaly evidence.
         max_forensic_anomaly = max(ela_score, noise_score)
         if max_forensic_anomaly >= 0.70:
             combined_fake_prob = float(max(weighted_fake, 0.65 + 0.30 * ((max_forensic_anomaly - 0.70) / 0.30)))
@@ -406,7 +444,7 @@ class ImageManipulationDetector:
         if is_fake:
             reasons = []
             if ela_score > 0.50:
-                reasons.append(f"inconsistent JPEG compression levels (ELA score {ela_score:.2f})")
+                reasons.append(f"inconsistent JPEG compression levels (ELA anomaly {ela_score:.2f})")
             if noise_score > 0.45:
                 reasons.append(f"spatial sensor noise variance anomalies (ratio {noise_metrics.get('noise_discrepancy_ratio', 1.0):.1f})")
             if model_fake_score > 0.55:
@@ -415,7 +453,7 @@ class ImageManipulationDetector:
             reason_text = ", and ".join(reasons) if reasons else "detected anomalies in image texture"
             explanation = (
                 f"Image flagged as {verdict.lower()} ({confidence_pct:.1f}% confidence) "
-                f"due to {reason_text}. See tampering heatmap for localized regions."
+                f"due to {reason_text}. See forensic anomaly map for artifact regions."
             )
         else:
             explanation = (
@@ -432,6 +470,23 @@ class ImageManipulationDetector:
             "dimensions": {"width": image.width, "height": image.height},
         }
 
+        classification_res = {
+            "label": "suspicious" if is_fake else "authentic",
+            "probability": round(combined_fake_prob if is_fake else combined_real_prob, 4)
+        }
+
+        anomaly_analysis_res = {
+            "ela_score": round(ela_score, 4),
+            "noise_score": round(noise_score, 4),
+            "forensic_details": forensic_details
+        }
+
+        localization_res = {
+            "available": heatmap_b64 is not None,
+            "heatmap_type": "forensic_anomaly",
+            "heatmap_base64": heatmap_b64
+        }
+
         return {
             "is_fake": is_fake,
             "verdict": verdict,
@@ -441,11 +496,16 @@ class ImageManipulationDetector:
                 "fake": round(combined_fake_prob, 4),
                 "real": round(combined_real_prob, 4),
             },
+            "classification": classification_res,
+            "anomaly_analysis": anomaly_analysis_res,
+            "localization": localization_res,
             "forensic_details": forensic_details,
             "heatmap_base64": heatmap_b64,
             "explanation": explanation,
+            "disclaimer": "Automated forensic assessment: visual anomalies indicate statistical discrepancies, not definitive proof of manipulation.",
             "error": None,
         }
+
 
 
 # Global singleton instance (lazy loaded)

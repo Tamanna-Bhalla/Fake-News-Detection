@@ -1,36 +1,54 @@
-FROM python:3.12-slim
+# ==============================================================================
+# Production Dockerfile for DTI Backend (FastAPI + Sentence-Transformers + EfficientNetB0)
+# ==============================================================================
+FROM python:3.12-slim AS runtime
 
+# Prevent bytecode generation and unbuffered I/O
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     TRANSFORMERS_NO_TF=1 \
     USE_TF=0 \
     TF_ENABLE_ONEDNN_OPTS=0 \
-    TF_CPP_MIN_LOG_LEVEL=3
+    TF_CPP_MIN_LOG_LEVEL=2 \
+    PORT=8000 \
+    HOST=0.0.0.0 \
+    ENVIRONMENT=production
 
 WORKDIR /app
 
-# Install system dependencies for OpenCV and image operations
+# Install minimal OS dependencies required for OpenCV headless and image decoders
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
-COPY DTI-Backend/requirements.txt /app/DTI-Backend/requirements.txt
-RUN pip install --no-cache-dir -r /app/DTI-Backend/requirements.txt \
-    tensorflow \
-    opencv-python-headless \
-    scipy \
-    pillow \
-    requests
+# Create non-root system user and group for hardened container security
+RUN groupadd -g 1000 appgroup && \
+    useradd -u 1000 -g appgroup -s /bin/bash -m appuser
 
-# Copy project files
+# Install pinned Python dependencies
+COPY DTI-Backend/requirements.txt /app/DTI-Backend/requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r /app/DTI-Backend/requirements.txt
+
+# Copy backend application source
 COPY DTI-Backend /app/DTI-Backend
-COPY "Image Detection" "/app/Image Detection"
 COPY research /app/research
+COPY "Image Detection" "/app/Image Detection"
+
+# Set ownership to non-root user
+RUN chown -R appuser:appgroup /app
 
 WORKDIR /app/DTI-Backend
 
+# Switch to non-root user
+USER appuser
+
 EXPOSE 8000
+
+# Container health probe checking ML subsystem readiness
+HEALTHCHECK --interval=30s --timeout=10s --start-period=35s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz')" || exit 1
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

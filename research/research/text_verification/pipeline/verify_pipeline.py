@@ -18,6 +18,7 @@ class VerificationPipeline:
             generate_search_query,
         )
         from text_verification.claim_processing.cleaner import ClaimCleaner
+        from text_verification.claim_processing.claim_classifier import ClaimClassifier
         from text_verification.utils.cache import get_cached_result, set_cached_result
         from text_verification.retrieval.google_news import GoogleNewsRetriever
         from text_verification.retrieval.wikipedia_api import WikipediaRetriever
@@ -26,6 +27,7 @@ class VerificationPipeline:
         self.normalize_headline = normalize_headline_to_claim
         self.generate_query = generate_search_query
         self.cleaner = ClaimCleaner()
+        self.claim_classifier = ClaimClassifier
         self.get_cached_result = get_cached_result
         self.set_cached_result = set_cached_result
         self.google_news = GoogleNewsRetriever()
@@ -40,12 +42,35 @@ class VerificationPipeline:
             return {
                 "claim": "",
                 "normalized_claim": "",
+                "claim_type": "non_verifiable",
+                "status": "unavailable",
                 "verdict": "Not Enough Information",
-                "confidence": 0.50,
+                "confidence": None,
                 "summary": "No headline was provided for verification.",
                 "reason": "Input was empty.",
                 "explanation": "No text claim was provided for verification.",
+                "limitations": ["No input provided."],
                 "conflicting_sources": False,
+                "evidence": [],
+                "sources": [],
+            }
+
+        # Classify claim epistemic type and check verifiability
+        claim_type, is_verifiable, type_explanation = self.claim_classifier.classify(headline_raw)
+        if not is_verifiable:
+            return {
+                "claim": headline_raw,
+                "normalized_claim": headline_raw,
+                "claim_type": claim_type,
+                "status": "completed",
+                "verdict": "Not Enough Information",
+                "confidence": None,
+                "summary": f"This statement is classified as {claim_type} and is not a verifiable factual claim.",
+                "reason": type_explanation,
+                "explanation": type_explanation,
+                "limitations": [type_explanation],
+                "conflicting_sources": False,
+                "evidence": [],
                 "sources": [],
             }
 
@@ -54,14 +79,19 @@ class VerificationPipeline:
             return {
                 "claim": headline_raw,
                 "normalized_claim": headline_raw,
-                "verdict": "UNVERIFIABLE",
-                "confidence": 0.50,
+                "claim_type": "non_verifiable",
+                "status": "completed",
+                "verdict": "Not Enough Information",
+                "confidence": None,
                 "summary": "Input is not a verifiable factual claim.",
                 "reason": "Input lacks concrete factual assertions (e.g. question, opinion, or headline fragment).",
                 "explanation": "Input does not contain a verifiable factual claim.",
+                "limitations": ["Input lacks concrete factual assertions."],
                 "conflicting_sources": False,
+                "evidence": [],
                 "sources": [],
             }
+
 
         normalized_claim = self.cleaner.clean(claim) or claim
         cached = self.get_cached_result(normalized_claim)
@@ -116,14 +146,19 @@ class VerificationPipeline:
         result = {
             "claim": headline_raw,
             "normalized_claim": normalized_claim,
+            "claim_type": claim_type,
+            "status": verdict_res.get("status", "completed"),
             "verdict": verdict_res["verdict"],
             "confidence": verdict_res["confidence"],
             "summary": verdict_res["summary"],
             "reason": verdict_res["explanation"],
             "explanation": verdict_res["explanation"],
+            "limitations": verdict_res.get("limitations", []),
             "conflicting_sources": verdict_res.get("conflicting_sources", False),
+            "evidence": verdict_res.get("evidence", []),
             "sources": verdict_res.get("sources", []),
         }
+
 
         self.set_cached_result(normalized_claim, result)
         return result

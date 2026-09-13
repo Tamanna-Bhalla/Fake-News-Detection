@@ -107,6 +107,12 @@ def evaluate_system():
         improved_scores.append(imp_score)
         improved_preds.append(imp_pred)
 
+    from sklearn.metrics import (
+        accuracy_score, precision_score, recall_score, f1_score,
+        roc_auc_score, confusion_matrix, balanced_accuracy_score,
+        brier_score_loss, average_precision_score
+    )
+
     y_true = np.array(y_true)
     baseline_cnn_preds = np.array(baseline_cnn_preds)
     baseline_cnn_scores = np.array(baseline_cnn_scores)
@@ -114,38 +120,68 @@ def evaluate_system():
     improved_preds = np.array(improved_preds)
     improved_scores = np.array(improved_scores)
 
-    # Compute Metrics
-    metrics = {
-        "Metric": ["Accuracy", "Precision", "Recall", "F1-Score", "ROC-AUC", "False Positive Rate (FPR)"],
-        "Existing Model (Raw CNN @ 0.50)": [
-            f"{accuracy_score(y_true, baseline_cnn_preds):.4f}",
-            f"{precision_score(y_true, baseline_cnn_preds, zero_division=0):.4f}",
-            f"{recall_score(y_true, baseline_cnn_preds, zero_division=0):.4f}",
-            f"{f1_score(y_true, baseline_cnn_preds, zero_division=0):.4f}",
-            f"{roc_auc_score(y_true, baseline_cnn_scores):.4f}",
-            f"{np.mean((baseline_cnn_preds == 1) & (y_true == 0)):.4f}",
-        ],
-        "Improved Hybrid Forensic Model": [
-            f"{accuracy_score(y_true, improved_preds):.4f}",
-            f"{precision_score(y_true, improved_preds, zero_division=0):.4f}",
-            f"{recall_score(y_true, improved_preds, zero_division=0):.4f}",
-            f"{f1_score(y_true, improved_preds, zero_division=0):.4f}",
-            f"{roc_auc_score(y_true, improved_scores):.4f}",
-            f"{np.mean((improved_preds == 1) & (y_true == 0)):.4f}",
-        ],
-    }
+    def calculate_ece(y_true, y_prob, n_bins=10):
+        """Calculate Expected Calibration Error (ECE)."""
+        bin_limits = np.linspace(0, 1, n_bins + 1)
+        ece = 0.0
+        n = len(y_true)
+        for i in range(n_bins):
+            in_bin = (y_prob >= bin_limits[i]) & (y_prob < bin_limits[i + 1])
+            bin_size = np.sum(in_bin)
+            if bin_size > 0:
+                bin_acc = np.mean(y_true[in_bin])
+                bin_conf = np.mean(y_prob[in_bin])
+                ece += (bin_size / n) * np.abs(bin_acc - bin_conf)
+        return ece
+
+    cm_base = confusion_matrix(y_true, baseline_cnn_preds)
+    cm_imp = confusion_matrix(y_true, improved_preds)
+
+    tn_base, fp_base, fn_base, tp_base = cm_base.ravel()
+    tn_imp, fp_imp, fn_imp, tp_imp = cm_imp.ravel()
+
+    spec_base = tn_base / (tn_base + fp_base) if (tn_base + fp_base) > 0 else 0.0
+    spec_imp = tn_imp / (tn_imp + fp_imp) if (tn_imp + fp_imp) > 0 else 0.0
+
+    fnr_base = fn_base / (fn_base + tp_base) if (fn_base + tp_base) > 0 else 0.0
+    fnr_imp = fn_imp / (fn_imp + tp_imp) if (fn_imp + tp_imp) > 0 else 0.0
+
+    brier_base = brier_score_loss(y_true, baseline_cnn_scores)
+    brier_imp = brier_score_loss(y_true, improved_scores)
+
+    ece_base = calculate_ece(y_true, baseline_cnn_scores)
+    ece_imp = calculate_ece(y_true, improved_scores)
+
+    auprc_base = average_precision_score(y_true, baseline_cnn_scores)
+    auprc_imp = average_precision_score(y_true, improved_scores)
+
+    # Compute Comprehensive Metrics Table
+    metrics_list = [
+        ("Accuracy", f"{accuracy_score(y_true, baseline_cnn_preds):.4f}", f"{accuracy_score(y_true, improved_preds):.4f}"),
+        ("Balanced Accuracy", f"{balanced_accuracy_score(y_true, baseline_cnn_preds):.4f}", f"{balanced_accuracy_score(y_true, improved_preds):.4f}"),
+        ("Precision", f"{precision_score(y_true, baseline_cnn_preds, zero_division=0):.4f}", f"{precision_score(y_true, improved_preds, zero_division=0):.4f}"),
+        ("Recall (Sensitivity)", f"{recall_score(y_true, baseline_cnn_preds, zero_division=0):.4f}", f"{recall_score(y_true, improved_preds, zero_division=0):.4f}"),
+        ("Specificity (TNR)", f"{spec_base:.4f}", f"{spec_imp:.4f}"),
+        ("F1-Score", f"{f1_score(y_true, baseline_cnn_preds, zero_division=0):.4f}", f"{f1_score(y_true, improved_preds, zero_division=0):.4f}"),
+        ("False Positive Rate (FPR)", f"{fp_base / (fp_base + tn_base):.4f}", f"{fp_imp / (fp_imp + tn_imp):.4f}"),
+        ("False Negative Rate (FNR)", f"{fnr_base:.4f}", f"{fnr_imp:.4f}"),
+        ("AUROC", f"{roc_auc_score(y_true, baseline_cnn_scores):.4f}", f"{roc_auc_score(y_true, improved_scores):.4f}"),
+        ("AUPRC", f"{auprc_base:.4f}", f"{auprc_imp:.4f}"),
+        ("Brier Calibration Score", f"{brier_base:.4f}", f"{brier_imp:.4f}"),
+        ("Expected Calibration Error", f"{ece_base:.4f}", f"{ece_imp:.4f}"),
+    ]
 
     print("\nBenchmark Results Summary Table:")
     print(f"| {'Metric':<30} | {'Existing Model (Raw CNN)':<25} | {'Improved Hybrid Model':<25} |")
     print(f"|{'-'*32}|{'-'*27}|{'-'*27}|")
-    for i in range(len(metrics["Metric"])):
-        print(f"| {metrics['Metric'][i]:<30} | {metrics['Existing Model (Raw CNN @ 0.50)'][i]:<25} | {metrics['Improved Hybrid Forensic Model'][i]:<25} |")
+    for name, base_val, imp_val in metrics_list:
+        print(f"| {name:<30} | {base_val:<25} | {imp_val:<25} |")
 
-    cm = confusion_matrix(y_true, improved_preds)
     print("\nImproved Model Confusion Matrix:")
-    print(f"  True Authentic -> Correctly Classified: {cm[0, 0]} | Misclassified as Fake: {cm[0, 1]}")
-    print(f"  True Spliced   -> Correctly Classified: {cm[1, 1]} | Misclassified as Real: {cm[1, 0]}")
+    print(f"  True Authentic -> Correctly Classified: {cm_imp[0, 0]} | Misclassified as Fake: {cm_imp[0, 1]}")
+    print(f"  True Spliced   -> Correctly Classified: {cm_imp[1, 1]} | Misclassified as Real: {cm_imp[1, 0]}")
 
 
 if __name__ == "__main__":
     evaluate_system()
+
